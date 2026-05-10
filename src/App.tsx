@@ -717,7 +717,8 @@ export function App() {
                 <div className="space-y-4 border-b border-slate-100 bg-slate-50/50 p-6">
                   <p className="text-sm font-semibold text-slate-800">Sync from GHL</p>
                   <p className="text-xs text-slate-500">
-                    Upserts inventory from the live phone-system API for one configured source. Run this if the table below is empty or out of date.
+                    Pulls every owned number for that subaccount and applies the <strong>same line intent</strong> you pick below to each row. Row labels are auto-set to{' '}
+                    <strong>your Sources tab name for that location (Step 1) · #1, #2, …</strong> (stable sort by phone). Run after buying new lines or if inventory is stale.
                   </p>
                   <div className="grid gap-4 sm:grid-cols-2">
                     <div className="sm:col-span-2">
