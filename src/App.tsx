@@ -344,6 +344,8 @@ export function App() {
   const [addingLiveKey, setAddingLiveKey] = useState<string | null>(null);
   const [liveDrafts, setLiveDrafts] = useState<Record<string, { intent: string; label: string }>>({});
   const [inventoryDrafts, setInventoryDrafts] = useState<Record<string, { intent: string; label: string }>>({});
+  /** Line intent `<select>` only after user clicks to edit (avoid looking like a casual dropdown). */
+  const [intentFieldEditing, setIntentFieldEditing] = useState<Record<string, boolean>>({});
   const [savingInventoryId, setSavingInventoryId] = useState<string | null>(null);
   const [syncPullLoc, setSyncPullLoc] = useState('');
   const [syncPullIntent, setSyncPullIntent] = useState<string>('remarketing');
@@ -703,6 +705,9 @@ export function App() {
                   <p className="mt-1 text-xs text-slate-600">
                     <strong>Assigned</strong> rows first, then <strong>in inventory</strong> (set line intent + label in the row, then <em>Save</em>), then <strong>live GHL only</strong> (pick intent, optional label, <em>Add to inventory</em>).
                   </p>
+                  <p className="mt-1 text-xs text-slate-600">
+                    <strong>New numbers</strong> bought later on that subaccount show up after you run <em>Sync numbers from GHL</em> (bulk pull) or appear as <strong>Live GHL only</strong> until you add them to inventory — no reconnect needed.
+                  </p>
                   <p className="mt-2 text-xs text-slate-700 rounded-lg border border-indigo-100 bg-indigo-50/50 px-3 py-2 leading-relaxed">
                     <strong className="text-indigo-950">Agency vs client lines:</strong> Lead / Remarketing here are for{' '}
                     <strong>client (SMB) subaccount</strong> SMS routing. Business-owner notification texts still go out from
@@ -837,8 +842,12 @@ export function App() {
                             const intentVal = lineIntentForSelect(
                               d?.intent ?? r.client_hub_phone_inventory_line_usage_intent_enum ?? 'remarketing',
                             );
+                            const persistedIntent = lineIntentForSelect(
+                              r.client_hub_phone_inventory_line_usage_intent_enum ?? 'remarketing',
+                            );
                             const labelVal =
                               d?.label ?? (r.optional_inventory_display_name_for_admin_ui_only || '');
+                            const intentEditing = !!intentFieldEditing[r.id];
                             return (
                               <tr key={row.key} className="hover:bg-slate-50/80">
                                 <td className="px-4 py-3">
@@ -850,26 +859,62 @@ export function App() {
                                   {formatE164(r.e164_phone_number_string_normalized_digits_only)}
                                 </td>
                                 <td className="px-4 py-3 align-top">
-                                  <select
-                                    className={cellSelectClass}
-                                    value={intentVal}
-                                    onChange={(e) => {
-                                      const intent = e.target.value;
-                                      setInventoryDrafts((p) => ({
-                                        ...p,
-                                        [r.id]: {
-                                          intent,
-                                          label: p[r.id]?.label ?? (r.optional_inventory_display_name_for_admin_ui_only || ''),
-                                        },
-                                      }));
-                                    }}
-                                  >
-                                    {INTENT_OPTIONS.map((x) => (
-                                      <option key={x} value={x}>
-                                        {x.replace(/_/g, ' ')}
-                                      </option>
-                                    ))}
-                                  </select>
+                                  {intentEditing ? (
+                                    <div className="flex flex-col gap-1.5">
+                                      <select
+                                        className={cellSelectClass}
+                                        value={intentVal}
+                                        onChange={(e) => {
+                                          const intent = e.target.value;
+                                          setInventoryDrafts((p) => ({
+                                            ...p,
+                                            [r.id]: {
+                                              intent,
+                                              label:
+                                                p[r.id]?.label ?? (r.optional_inventory_display_name_for_admin_ui_only || ''),
+                                            },
+                                          }));
+                                        }}
+                                      >
+                                        {INTENT_OPTIONS.map((x) => (
+                                          <option key={x} value={x}>
+                                            {x.replace(/_/g, ' ')}
+                                          </option>
+                                        ))}
+                                      </select>
+                                      <button
+                                        type="button"
+                                        className="self-start text-[10px] font-medium text-slate-500 hover:text-slate-800"
+                                        onClick={() =>
+                                          setIntentFieldEditing((p) => {
+                                            const n = { ...p };
+                                            delete n[r.id];
+                                            return n;
+                                          })
+                                        }
+                                      >
+                                        Done
+                                      </button>
+                                    </div>
+                                  ) : (
+                                    <button
+                                      type="button"
+                                      className="group w-full max-w-[11rem] rounded-md border border-transparent px-1 py-1 text-left transition hover:border-slate-200 hover:bg-slate-50"
+                                      onClick={() =>
+                                        setIntentFieldEditing((p) => ({ ...p, [r.id]: true }))
+                                      }
+                                    >
+                                      <span className="block text-xs font-medium text-slate-900">
+                                        {lineIntentLabelForUi(intentVal)}
+                                        {intentVal !== persistedIntent ? (
+                                          <span className="ml-1 font-normal text-amber-700">(unsaved)</span>
+                                        ) : null}
+                                      </span>
+                                      <span className="mt-0.5 block text-[10px] text-indigo-600 opacity-70 group-hover:opacity-100">
+                                        Click to change intent
+                                      </span>
+                                    </button>
+                                  )}
                                 </td>
                                 <td className="px-4 py-3 font-mono text-[11px] text-slate-700 break-all">{locId}</td>
                                 <td className="px-4 py-3 text-xs text-slate-700">
@@ -904,6 +949,12 @@ export function App() {
                                       className={btnSecondary}
                                       disabled={savingInventoryId === r.id}
                                       onClick={async () => {
+                                        if (intentVal !== persistedIntent) {
+                                          const ok = window.confirm(
+                                            'This number’s line intent (lead vs remarketing) was set for a specific routing slot and may already have workflows or supporting infra tied to it.\n\nAre you sure you want to change the intent?',
+                                          );
+                                          if (!ok) return;
+                                        }
                                         setSavingInventoryId(r.id);
                                         try {
                                           await crmJson(
@@ -917,6 +968,11 @@ export function App() {
                                             },
                                           );
                                           setInventoryDrafts((p) => {
+                                            const n = { ...p };
+                                            delete n[r.id];
+                                            return n;
+                                          });
+                                          setIntentFieldEditing((p) => {
                                             const n = { ...p };
                                             delete n[r.id];
                                             return n;
