@@ -66,6 +66,8 @@ function parseLineIntentFromPickerDisplayLabel(label: string): (typeof INTENT_OP
   const liveArrow = s.match(/live GHL\s*→\s*(lead_response|lead|remarketing|general_inbound|other)/i);
   if (liveArrow) return lineIntentForSelect(liveArrow[1]);
   if (/auto-adds as remarketing/i.test(s)) return 'remarketing';
+  const defaultsStep1 = s.match(/defaults to\s+(lead|remarketing)\s+from Step 1/i);
+  if (defaultsStep1) return lineIntentForSelect(defaultsStep1[1]);
   return null;
 }
 
@@ -105,6 +107,51 @@ function formatE164(digits: string) {
 
 function normE164Digits(digits: string) {
   return String(digits || '').replace(/\D/g, '');
+}
+
+/**
+ * Step 2 overview merges two picker GETs (lead + remarketing filters). The same live GHL number appears
+ * twice with different autocreate intents; dedupe is e164+loc only — keep the row that matches the
+ * source’s Step-1 default intent.
+ */
+function mergeOverviewPickerLists(lists: PickerOption[][], sourcesForDefaultMerge: SourceRow[]) {
+  const srcByLoc = new Map(
+    sourcesForDefaultMerge
+      .filter((s) => !s.row_disabled_boolean)
+      .map((s) => [String(s.ghl_subaccount_location_id_string_that_phone_numbers_belong_to).trim(), s]),
+  );
+
+  const pickerKey = (o: PickerOption) =>
+    `${normE164Digits(o.e164_phone_number_string_normalized_digits_only)}::${o.ghl_subaccount_location_id_string}`;
+
+  const desiredDefaultIntentForLoc = (loc: string) =>
+    lineIntentForSelect(srcByLoc.get(String(loc).trim())?.default_client_hub_phone_inventory_line_usage_intent_enum);
+
+  const byKey = new Map<string, PickerOption>();
+
+  for (const list of lists) {
+    for (const o of list) {
+      const k = pickerKey(o);
+      const existing = byKey.get(k);
+      if (!existing) {
+        byKey.set(k, o);
+        continue;
+      }
+      const oLive = o.picker_row_kind_enum === PICKER_KIND_LIVE_GHL;
+      const eLive = existing.picker_row_kind_enum === PICKER_KIND_LIVE_GHL;
+      if (oLive && eLive) {
+        const loc = String(o.ghl_subaccount_location_id_string || '').trim();
+        const want = desiredDefaultIntentForLoc(loc);
+        const exI = assignmentIntentFromPickerOption(existing);
+        const oI = assignmentIntentFromPickerOption(o);
+        if (oI === want && exI !== want) {
+          byKey.set(k, o);
+        }
+        continue;
+      }
+    }
+  }
+  return [...byKey.values()];
 }
 
 /** Rows that will be cascade-deleted when a source subaccount is removed (matches backend DELETE). */
@@ -283,11 +330,13 @@ export function App() {
   const [inv, setInv] = useState<InvRow[]>([]);
   const [asg, setAsg] = useState<AsgRow[]>([]);
 
-  const loadSources = useCallback(async () => {
+  const loadSources = useCallback(async (): Promise<SourceRow[]> => {
     const r = await crmJson<{ ok: boolean; data: SourceRow[] }>(
       '/phone-routing/admin/configured-ghl-subaccount-source-location-rows',
     );
-    setSources(r.data || []);
+    const rows = r.data || [];
+    setSources(rows);
+    return rows;
   }, []);
 
   const loadSourceCatalog = useCallback(async () => {
@@ -316,7 +365,8 @@ export function App() {
     setAsg(r.data || []);
   }, []);
 
-  const loadOverviewPickers = useCallback(async () => {
+  const loadOverviewPickers = useCallback(async (sourcesSnapshot?: SourceRow[]) => {
+    const srcRows = sourcesSnapshot ?? sources;
     try {
       const lists = await Promise.all(
         INTENT_OPTIONS.map((intent) =>
@@ -325,27 +375,18 @@ export function App() {
           ).then((r) => r.data || []),
         ),
       );
-      const seen = new Set<string>();
-      const merged: PickerOption[] = [];
-      for (const list of lists) {
-        for (const o of list) {
-          const k = `${normE164Digits(o.e164_phone_number_string_normalized_digits_only)}::${o.ghl_subaccount_location_id_string}`;
-          if (seen.has(k)) continue;
-          seen.add(k);
-          merged.push(o);
-        }
-      }
-      setOverviewPickerOptions(merged);
+      setOverviewPickerOptions(mergeOverviewPickerLists(lists, srcRows));
     } catch {
       setOverviewPickerOptions([]);
     }
-  }, []);
+  }, [sources]);
 
   const refresh = useCallback(async () => {
     setErr(null);
     setLoading(true);
     try {
-      await Promise.all([loadSources(), loadInv(), loadAsg(), loadSourceCatalog(), loadOverviewPickers()]);
+      const [srcRows] = await Promise.all([loadSources(), loadInv(), loadAsg(), loadSourceCatalog()]);
+      await loadOverviewPickers(srcRows);
     } catch (e: unknown) {
       setErr(e instanceof Error ? e.message : String(e));
     } finally {
@@ -701,7 +742,8 @@ export function App() {
                         setNewLoc('');
                         setNewLocLabel('');
                         setNewSourceDefaultIntent('remarketing');
-                        await loadSources();
+                        const srcRows = await loadSources();
+                        await loadOverviewPickers(srcRows);
                       } catch (e: unknown) {
                         setErr(e instanceof Error ? e.message : String(e));
                       }
@@ -756,7 +798,8 @@ export function App() {
                                           },
                                         );
                                         syncIntentAutoAppliedKeyRef.current = '';
-                                        await loadSources();
+                                        const srcRows = await loadSources();
+                                        await loadOverviewPickers(srcRows);
                                       } catch (err: unknown) {
                                         setErr(err instanceof Error ? err.message : String(err));
                                       } finally {
@@ -1092,7 +1135,7 @@ export function App() {
                                           });
                                           setIntentFieldEditing((p) => {
                                             const n = { ...p };
-                                            delete n[r.id];
+                                            delete n[row.key];
                                             return n;
                                           });
                                           await loadInv();
@@ -1602,10 +1645,10 @@ export function App() {
                     });
                     setPendingSourceDelete(null);
                     setSourceDeleteAcknowledged(false);
-                    await loadSources();
+                    const srcRows = await loadSources();
                     await loadInv();
                     await loadAsg();
-                    await loadOverviewPickers();
+                    await loadOverviewPickers(srcRows);
                     await loadPicker();
                   } catch (e: unknown) {
                     setErr(e instanceof Error ? e.message : String(e));
