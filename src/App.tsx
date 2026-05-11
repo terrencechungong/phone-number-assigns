@@ -365,8 +365,12 @@ export function App() {
     setAsg(r.data || []);
   }, []);
 
+  /** Avoid `[sources]` on loadOverviewPickers — that would recreate `refresh` every fetch and retrigger `useEffect([refresh])` forever. */
+  const sourcesRef = useRef<SourceRow[]>([]);
+  sourcesRef.current = sources;
+
   const loadOverviewPickers = useCallback(async (sourcesSnapshot?: SourceRow[]) => {
-    const srcRows = sourcesSnapshot ?? sources;
+    const srcRows = sourcesSnapshot ?? sourcesRef.current;
     try {
       const lists = await Promise.all(
         INTENT_OPTIONS.map((intent) =>
@@ -379,7 +383,7 @@ export function App() {
     } catch {
       setOverviewPickerOptions([]);
     }
-  }, [sources]);
+  }, []);
 
   const refresh = useCallback(async () => {
     setErr(null);
