@@ -1345,7 +1345,9 @@ export function App() {
                       <code className="rounded bg-slate-200/80 px-1 font-mono text-[10px]">
                         client_hub_primary_ghl_location_id_for_phone_and_sms_routing
                       </code>{' '}
-                      on the client. One number per line type per client; each number can only belong to one client.
+                      on the client. Up to <strong>two different numbers</strong> per client: <strong>one Lead</strong> and{' '}
+                      <strong>one Remarketing</strong> (Mongo enforces one row per line type per client). Each E.164 can only
+                      be assigned to one client globally.
                     </p>
                     <p className="mt-3 text-xs text-slate-700 rounded-lg border border-slate-200 bg-slate-50/90 px-3 py-2 leading-relaxed">
                       <strong className="text-slate-900">Owner / internal notification SMS</strong> is sent from your{' '}
