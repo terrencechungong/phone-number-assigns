@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { crmJson } from './crm';
 import { SearchableGhlLocationSelect, type GhlCatalogRow } from './SearchableGhlLocationSelect';
 
@@ -9,6 +9,8 @@ type SourceRow = {
   ghl_subaccount_location_id_string_that_phone_numbers_belong_to: string;
   optional_human_readable_label_for_admin_ui_only?: string | null;
   row_disabled_boolean?: boolean;
+  /** Default lead/remarketing for inventory when syncing from GHL (and fallback if sync body omits intent). */
+  default_client_hub_phone_inventory_line_usage_intent_enum?: string | null;
 };
 
 type InvRow = {
@@ -103,6 +105,19 @@ function formatE164(digits: string) {
 
 function normE164Digits(digits: string) {
   return String(digits || '').replace(/\D/g, '');
+}
+
+/** Rows that will be cascade-deleted when a source subaccount is removed (matches backend DELETE). */
+function getSourceDeleteImpact(source: SourceRow, invList: InvRow[], asgList: AsgRow[]) {
+  const locId = String(source.ghl_subaccount_location_id_string_that_phone_numbers_belong_to || '').trim();
+  const invRows = invList.filter(
+    (i) => String(i.ghl_subaccount_location_id_string_for_which_subaccount_this_number_was_provisioned || '').trim() === locId,
+  );
+  const e164Set = new Set(
+    invRows.map((i) => normE164Digits(i.e164_phone_number_string_normalized_digits_only)).filter((d) => d.length >= 10),
+  );
+  const asgHits = asgList.filter((a) => e164Set.has(normE164Digits(a.e164_phone_number_string_normalized_digits_only)));
+  return { locId, invCount: invRows.length, asgCount: asgHits.length };
 }
 
 function locationDisplayName(locationId: string, sources: SourceRow[], catalog: GhlCatalogRow[]) {
@@ -254,6 +269,10 @@ const cellSelectClass =
 const cellInputClass =
   'w-full min-w-[6rem] max-w-[10rem] rounded-md border border-slate-200 bg-white px-2 py-1.5 text-xs text-slate-900';
 
+/** Same shell as other table inputs; no chevron / button styling until user focuses to edit. */
+const intentReadonlyFieldClass =
+  'w-full max-w-[11rem] cursor-text rounded-md border border-slate-200 bg-white px-2 py-1.5 text-xs font-normal text-slate-900 outline-none read-only:bg-white read-only:cursor-text focus:border-indigo-400 focus:ring-1 focus:ring-indigo-400/30';
+
 export function App() {
   const [tab, setTab] = useState<Tab>('sources');
   const [err, setErr] = useState<string | null>(null);
@@ -340,6 +359,7 @@ export function App() {
 
   const [newLoc, setNewLoc] = useState('');
   const [newLocLabel, setNewLocLabel] = useState('');
+  const [newSourceDefaultIntent, setNewSourceDefaultIntent] = useState<string>('remarketing');
   const [overviewPickerOptions, setOverviewPickerOptions] = useState<PickerOption[]>([]);
   const [addingLiveKey, setAddingLiveKey] = useState<string | null>(null);
   const [liveDrafts, setLiveDrafts] = useState<Record<string, { intent: string; label: string }>>({});
@@ -347,12 +367,19 @@ export function App() {
   /** Line intent `<select>` only after user clicks to edit (avoid looking like a casual dropdown). */
   const [intentFieldEditing, setIntentFieldEditing] = useState<Record<string, boolean>>({});
   const [savingInventoryId, setSavingInventoryId] = useState<string | null>(null);
+  const [pendingSourceDelete, setPendingSourceDelete] = useState<SourceRow | null>(null);
+  const [sourceDeleteAcknowledged, setSourceDeleteAcknowledged] = useState(false);
+  const [deletingSource, setDeletingSource] = useState(false);
   const [syncPullLoc, setSyncPullLoc] = useState('');
   const [syncPullIntent, setSyncPullIntent] = useState<string>('remarketing');
   const [asgClientSubaccountLocationId, setAsgClientSubaccountLocationId] = useState('');
   const [pickerOptions, setPickerOptions] = useState<PickerOption[]>([]);
   const [pickIdx, setPickIdx] = useState<number>(-1);
   const [pickerLoading, setPickerLoading] = useState(false);
+  const [patchingSourceIntentId, setPatchingSourceIntentId] = useState<string | null>(null);
+  const [editingSourceDefaultIntentId, setEditingSourceDefaultIntentId] = useState<string | null>(null);
+  /** Last (location + source default intent) we auto-applied to the sync dropdown — avoids clobbering manual picks on refresh. */
+  const syncIntentAutoAppliedKeyRef = useRef<string>('');
 
   const loadPicker = useCallback(async () => {
     setPickerLoading(true);
@@ -373,6 +400,26 @@ export function App() {
     if (tab !== 'assign' || loading) return;
     void loadPicker();
   }, [tab, loading, loadPicker]);
+
+  /** Pre-fill “Line intent for synced rows” from Step 1 default when that source row (or its default) first becomes available. */
+  useEffect(() => {
+    const lid = syncPullLoc.trim();
+    if (!lid) {
+      syncIntentAutoAppliedKeyRef.current = '';
+      return;
+    }
+    const src = sources.find(
+      (s) =>
+        String(s.ghl_subaccount_location_id_string_that_phone_numbers_belong_to).trim() === lid && !s.row_disabled_boolean,
+    );
+    const defRaw = src?.default_client_hub_phone_inventory_line_usage_intent_enum;
+    if (defRaw == null || String(defRaw).trim() === '') return;
+    const def = lineIntentForSelect(defRaw);
+    const key = `${lid}::${def}`;
+    if (syncIntentAutoAppliedKeyRef.current === key) return;
+    syncIntentAutoAppliedKeyRef.current = key;
+    setSyncPullIntent(def);
+  }, [syncPullLoc, sources]);
 
   const configuredSourceLocationIds = useMemo(
     () =>
@@ -578,6 +625,19 @@ export function App() {
                   <p className="mt-1 text-xs text-slate-500">
                     Add each GHL location whose phone numbers you want available in this routing system.
                   </p>
+                  <div
+                    role="note"
+                    className="mt-3 rounded-xl border-2 border-red-400 bg-red-50 px-4 py-3 text-xs font-medium leading-relaxed text-red-950 shadow-sm"
+                  >
+                    <p className="font-bold uppercase tracking-wide text-red-800">Emergency — removing a source</p>
+                    <p className="mt-1.5">
+                      If you <strong>Remove</strong> a source row, the system permanently deletes{' '}
+                      <strong>all manual inventory numbers</strong> for that GHL subaccount <em>and</em>{' '}
+                      <strong>every client assignment</strong> in Mongo that uses any of those numbers. Client SMS routing can
+                      break until you add the source again and re-sync / re-assign. You will see a confirmation dialog with exact
+                      counts before anything is deleted.
+                    </p>
+                  </div>
                 </div>
                 <div className="grid gap-4 border-b border-slate-100 p-6 sm:grid-cols-2">
                   <div className="sm:col-span-2">
@@ -607,6 +667,22 @@ export function App() {
                       onChange={(e) => setNewLocLabel(e.target.value)}
                     />
                   </Field>
+                  <Field
+                    label="Default line intent for numbers from this subaccount"
+                    hint="Used when you run Sync from GHL (Step 2) and as the fallback if the sync request omits intent. You can change it later in the table."
+                  >
+                    <select
+                      className={inputClass}
+                      value={newSourceDefaultIntent}
+                      onChange={(e) => setNewSourceDefaultIntent(e.target.value)}
+                    >
+                      {INTENT_OPTIONS.map((x) => (
+                        <option key={x} value={x}>
+                          {x === 'lead' ? 'Lead (lead response line)' : 'Remarketing'}
+                        </option>
+                      ))}
+                    </select>
+                  </Field>
                 </div>
                 <div className="flex justify-end border-b border-slate-100 px-6 py-3">
                   <button
@@ -619,10 +695,12 @@ export function App() {
                           body: JSON.stringify({
                             ghl_subaccount_location_id_string_that_phone_numbers_belong_to: newLoc.trim(),
                             optional_human_readable_label_for_admin_ui_only: newLocLabel.trim() || null,
+                            default_client_hub_phone_inventory_line_usage_intent_enum: newSourceDefaultIntent,
                           }),
                         });
                         setNewLoc('');
                         setNewLocLabel('');
+                        setNewSourceDefaultIntent('remarketing');
                         await loadSources();
                       } catch (e: unknown) {
                         setErr(e instanceof Error ? e.message : String(e));
@@ -638,6 +716,7 @@ export function App() {
                       <tr className="border-b border-slate-100 bg-slate-50/50 text-xs font-semibold uppercase tracking-wide text-slate-500">
                         <th className="px-6 py-3">Location ID</th>
                         <th className="px-6 py-3">Label</th>
+                        <th className="px-6 py-3 min-w-[9rem]">Default intent (numbers)</th>
                         <th className="px-6 py-3">Status</th>
                         <th className="px-6 py-3 text-right">Actions</th>
                       </tr>
@@ -645,7 +724,7 @@ export function App() {
                     <tbody className="divide-y divide-slate-100">
                       {sources.length === 0 ? (
                         <tr>
-                          <td colSpan={4} className="px-6 py-12 text-center text-sm text-slate-500">
+                          <td colSpan={5} className="px-6 py-12 text-center text-sm text-slate-500">
                             No sources yet. Add a GHL subaccount location above.
                           </td>
                         </tr>
@@ -656,6 +735,60 @@ export function App() {
                               {s.ghl_subaccount_location_id_string_that_phone_numbers_belong_to}
                             </td>
                             <td className="px-6 py-3 text-slate-700">{s.optional_human_readable_label_for_admin_ui_only || '—'}</td>
+                            <td className="px-6 py-3 align-top">
+                              {editingSourceDefaultIntentId === s.id ? (
+                                <div className="flex max-w-[11rem] flex-col gap-1.5">
+                                  <select
+                                    className={cellSelectClass}
+                                    disabled={patchingSourceIntentId === s.id}
+                                    value={lineIntentForSelect(s.default_client_hub_phone_inventory_line_usage_intent_enum)}
+                                    onChange={async (e) => {
+                                      const v = e.target.value as (typeof INTENT_OPTIONS)[number];
+                                      setPatchingSourceIntentId(s.id);
+                                      try {
+                                        await crmJson(
+                                          `/phone-routing/admin/configured-ghl-subaccount-source-location-rows/${s.id}`,
+                                          {
+                                            method: 'PATCH',
+                                            body: JSON.stringify({
+                                              default_client_hub_phone_inventory_line_usage_intent_enum: v,
+                                            }),
+                                          },
+                                        );
+                                        syncIntentAutoAppliedKeyRef.current = '';
+                                        await loadSources();
+                                      } catch (err: unknown) {
+                                        setErr(err instanceof Error ? err.message : String(err));
+                                      } finally {
+                                        setPatchingSourceIntentId(null);
+                                      }
+                                    }}
+                                  >
+                                    {INTENT_OPTIONS.map((x) => (
+                                      <option key={x} value={x}>
+                                        {x === 'lead' ? 'Lead' : 'Remarketing'}
+                                      </option>
+                                    ))}
+                                  </select>
+                                  <button
+                                    type="button"
+                                    className="self-start text-[10px] font-medium text-slate-500 hover:text-slate-800"
+                                    onClick={() => setEditingSourceDefaultIntentId(null)}
+                                  >
+                                    Done
+                                  </button>
+                                </div>
+                              ) : (
+                                <input
+                                  readOnly
+                                  className={intentReadonlyFieldClass}
+                                  value={lineIntentLabelForUi(s.default_client_hub_phone_inventory_line_usage_intent_enum)}
+                                  title="Click to change default intent for new syncs"
+                                  onClick={() => setEditingSourceDefaultIntentId(s.id)}
+                                  onFocus={() => setEditingSourceDefaultIntentId(s.id)}
+                                />
+                              )}
+                            </td>
                             <td className="px-6 py-3">
                               {s.row_disabled_boolean ? (
                                 <span className="rounded-full bg-amber-100 px-2 py-0.5 text-xs font-medium text-amber-800">
@@ -671,16 +804,9 @@ export function App() {
                               <button
                                 type="button"
                                 className={btnDanger}
-                                onClick={async () => {
-                                  if (!confirm('Delete this source row?')) return;
-                                  try {
-                                    await crmJson(`/phone-routing/admin/configured-ghl-subaccount-source-location-rows/${s.id}`, {
-                                      method: 'DELETE',
-                                    });
-                                    await loadSources();
-                                  } catch (e: unknown) {
-                                    setErr(e instanceof Error ? e.message : String(e));
-                                  }
+                                onClick={() => {
+                                  setSourceDeleteAcknowledged(false);
+                                  setPendingSourceDelete(s);
                                 }}
                               >
                                 Remove
@@ -848,7 +974,7 @@ export function App() {
                             );
                             const labelVal =
                               d?.label ?? (r.optional_inventory_display_name_for_admin_ui_only || '');
-                            const intentEditing = !!intentFieldEditing[r.id];
+                            const intentEditing = !!intentFieldEditing[row.key];
                             return (
                               <tr key={row.key} className="hover:bg-slate-50/80">
                                 <td className="px-4 py-3">
@@ -889,7 +1015,7 @@ export function App() {
                                         onClick={() =>
                                           setIntentFieldEditing((p) => {
                                             const n = { ...p };
-                                            delete n[r.id];
+                                            delete n[row.key];
                                             return n;
                                           })
                                         }
@@ -898,23 +1024,14 @@ export function App() {
                                       </button>
                                     </div>
                                   ) : (
-                                    <button
-                                      type="button"
-                                      className="group w-full max-w-[11rem] rounded-md border border-transparent px-1 py-1 text-left transition hover:border-slate-200 hover:bg-slate-50"
-                                      onClick={() =>
-                                        setIntentFieldEditing((p) => ({ ...p, [r.id]: true }))
-                                      }
-                                    >
-                                      <span className="block text-xs font-medium text-slate-900">
-                                        {lineIntentLabelForUi(intentVal)}
-                                        {intentVal !== persistedIntent ? (
-                                          <span className="ml-1 font-normal text-amber-700">(unsaved)</span>
-                                        ) : null}
-                                      </span>
-                                      <span className="mt-0.5 block text-[10px] text-indigo-600 opacity-70 group-hover:opacity-100">
-                                        Click to change intent
-                                      </span>
-                                    </button>
+                                    <input
+                                      readOnly
+                                      className={intentReadonlyFieldClass}
+                                      value={`${lineIntentLabelForUi(intentVal)}${intentVal !== persistedIntent ? ' (unsaved)' : ''}`}
+                                      title="Click to change line intent"
+                                      onClick={() => setIntentFieldEditing((p) => ({ ...p, [row.key]: true }))}
+                                      onFocus={() => setIntentFieldEditing((p) => ({ ...p, [row.key]: true }))}
+                                    />
                                   )}
                                 </td>
                                 <td className="px-4 py-3 font-mono text-[11px] text-slate-700 break-all">{locId}</td>
@@ -1028,7 +1145,11 @@ export function App() {
                             ld?.intent ??
                               pick.client_hub_phone_inventory_line_usage_intent_for_autocreate_when_row_created_via_picker_enum,
                           );
+                          const livePersistedIntent = lineIntentForSelect(
+                            pick.client_hub_phone_inventory_line_usage_intent_for_autocreate_when_row_created_via_picker_enum,
+                          );
                           const liveLabel = ld?.label ?? '';
+                          const liveIntentEditing = !!intentFieldEditing[row.key];
                           return (
                             <tr key={row.key} className="bg-amber-50/30 hover:bg-amber-50/50">
                               <td className="px-4 py-3">
@@ -1040,23 +1161,49 @@ export function App() {
                                 {formatE164(pick.e164_phone_number_string_normalized_digits_only)}
                               </td>
                               <td className="px-4 py-3 align-top">
-                                <select
-                                  className={cellSelectClass}
-                                  value={liveIntent}
-                                  onChange={(e) => {
-                                    const intent = e.target.value;
-                                    setLiveDrafts((p) => ({
-                                      ...p,
-                                      [addKey]: { intent, label: p[addKey]?.label ?? '' },
-                                    }));
-                                  }}
-                                >
-                                  {INTENT_OPTIONS.map((x) => (
-                                    <option key={x} value={x}>
-                                      {x.replace(/_/g, ' ')}
-                                    </option>
-                                  ))}
-                                </select>
+                                {liveIntentEditing ? (
+                                  <div className="flex max-w-[11rem] flex-col gap-1.5">
+                                    <select
+                                      className={cellSelectClass}
+                                      value={liveIntent}
+                                      onChange={(e) => {
+                                        const intent = e.target.value;
+                                        setLiveDrafts((p) => ({
+                                          ...p,
+                                          [addKey]: { intent, label: p[addKey]?.label ?? '' },
+                                        }));
+                                      }}
+                                    >
+                                      {INTENT_OPTIONS.map((x) => (
+                                        <option key={x} value={x}>
+                                          {x.replace(/_/g, ' ')}
+                                        </option>
+                                      ))}
+                                    </select>
+                                    <button
+                                      type="button"
+                                      className="self-start text-[10px] font-medium text-slate-500 hover:text-slate-800"
+                                      onClick={() =>
+                                        setIntentFieldEditing((p) => {
+                                          const n = { ...p };
+                                          delete n[row.key];
+                                          return n;
+                                        })
+                                      }
+                                    >
+                                      Done
+                                    </button>
+                                  </div>
+                                ) : (
+                                  <input
+                                    readOnly
+                                    className={intentReadonlyFieldClass}
+                                    value={`${lineIntentLabelForUi(liveIntent)}${liveIntent !== livePersistedIntent ? ' (draft)' : ''}`}
+                                    title="Click to choose line intent before Add to inventory"
+                                    onClick={() => setIntentFieldEditing((p) => ({ ...p, [row.key]: true }))}
+                                    onFocus={() => setIntentFieldEditing((p) => ({ ...p, [row.key]: true }))}
+                                  />
+                                )}
                               </td>
                               <td className="px-4 py-3 font-mono text-[11px] text-slate-700 break-all">{locId}</td>
                               <td className="px-4 py-3 text-xs text-slate-700">
@@ -1367,6 +1514,112 @@ export function App() {
           </div>
         </main>
       </div>
+
+      {pendingSourceDelete ? (
+        <div
+          className="fixed inset-0 z-[100] flex items-center justify-center bg-slate-950/75 p-4 backdrop-blur-sm"
+          role="alertdialog"
+          aria-modal="true"
+          aria-labelledby="source-delete-emergency-title"
+          aria-describedby="source-delete-emergency-desc"
+        >
+          <div className="max-h-[90vh] w-full max-w-lg overflow-y-auto rounded-2xl border-2 border-red-600 bg-white shadow-2xl ring-4 ring-red-600/20">
+            <div className="border-b-2 border-red-600 bg-red-600 px-5 py-4">
+              <p id="source-delete-emergency-title" className="text-lg font-black uppercase tracking-tight text-white">
+                Emergency — delete source subaccount
+              </p>
+              <p className="mt-1 text-xs font-medium text-red-100">
+                This is irreversible in Mongo for inventory and assignments tied to this pool.
+              </p>
+            </div>
+            <div id="source-delete-emergency-desc" className="space-y-4 px-5 py-5 text-sm text-slate-800">
+              {(() => {
+                const { locId, invCount, asgCount } = getSourceDeleteImpact(pendingSourceDelete, inv, asg);
+                const label =
+                  pendingSourceDelete.optional_human_readable_label_for_admin_ui_only?.trim() || '—';
+                return (
+                  <>
+                    <p>
+                      You are about to remove source{' '}
+                      <span className="font-semibold text-slate-900">{label}</span>
+                    </p>
+                    <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 font-mono text-[11px] text-slate-700 break-all">
+                      {locId || '(missing location id)'}
+                    </div>
+                    <ul className="list-disc space-y-2 pl-5 text-sm text-slate-800">
+                      <li>
+                        <strong>{invCount}</strong> manual inventory row{invCount === 1 ? '' : 's'} for this subaccount will be{' '}
+                        <strong className="text-red-700">deleted</strong>.
+                      </li>
+                      <li>
+                        <strong>{asgCount}</strong> client assignment{asgCount === 1 ? '' : 's'} that use those numbers will be{' '}
+                        <strong className="text-red-700">deleted</strong> (routing can break until fixed).
+                      </li>
+                      <li>
+                        The <strong>source configuration row</strong> itself will be removed — you cannot sync that location again until you re-add it in Step 1.
+                      </li>
+                    </ul>
+                    <label className="flex cursor-pointer items-start gap-3 rounded-lg border border-amber-300 bg-amber-50 px-3 py-3 text-xs text-amber-950">
+                      <input
+                        type="checkbox"
+                        className="mt-0.5 h-4 w-4 shrink-0 rounded border-amber-600 text-red-600 focus:ring-red-500"
+                        checked={sourceDeleteAcknowledged}
+                        onChange={(e) => setSourceDeleteAcknowledged(e.target.checked)}
+                      />
+                      <span>
+                        I understand that <strong>inventory and assignments will be permanently removed</strong> and clients may
+                        stop receiving routed SMS from these numbers until we reconfigure.
+                      </span>
+                    </label>
+                  </>
+                );
+              })()}
+            </div>
+            <div className="flex flex-wrap justify-end gap-2 border-t border-slate-200 bg-slate-50 px-5 py-4">
+              <button
+                type="button"
+                className="rounded-lg border border-slate-300 bg-white px-4 py-2 text-sm font-semibold text-slate-800 shadow-sm hover:bg-slate-50"
+                disabled={deletingSource}
+                onClick={() => {
+                  setPendingSourceDelete(null);
+                  setSourceDeleteAcknowledged(false);
+                }}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                className="rounded-lg border-2 border-red-700 bg-red-600 px-4 py-2 text-sm font-bold text-white shadow-sm hover:bg-red-700 disabled:cursor-not-allowed disabled:opacity-40"
+                disabled={!sourceDeleteAcknowledged || deletingSource}
+                onClick={async () => {
+                  const id = pendingSourceDelete?.id;
+                  if (!id || !sourceDeleteAcknowledged) return;
+                  setDeletingSource(true);
+                  setErr(null);
+                  try {
+                    await crmJson(`/phone-routing/admin/configured-ghl-subaccount-source-location-rows/${id}`, {
+                      method: 'DELETE',
+                    });
+                    setPendingSourceDelete(null);
+                    setSourceDeleteAcknowledged(false);
+                    await loadSources();
+                    await loadInv();
+                    await loadAsg();
+                    await loadOverviewPickers();
+                    await loadPicker();
+                  } catch (e: unknown) {
+                    setErr(e instanceof Error ? e.message : String(e));
+                  } finally {
+                    setDeletingSource(false);
+                  }
+                }}
+              >
+                {deletingSource ? 'Deleting…' : 'Delete source permanently'}
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
     </div>
   );
 }
